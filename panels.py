@@ -613,10 +613,17 @@ class AGENDER_OT_dock_left(bpy.types.Operator):
         )
         if len(views) >= 2:
             chat = views[0]
-            chat.type = "TEXT_EDITOR"
             for sp in chat.spaces:
                 if hasattr(sp, "show_region_ui"):
                     sp.show_region_ui = True
+                if hasattr(sp, "overlay"):
+                    sp.overlay.show_overlays = False
+                if hasattr(sp, "show_gizmo"):
+                    sp.show_gizmo = False
+                if hasattr(sp, "show_region_toolbar"):
+                    sp.show_region_toolbar = False
+                if hasattr(sp, "show_region_header"):
+                    sp.show_region_header = False
 
         self.report({"INFO"}, "Agender docked — click the Agender tab in the left sidebar")
         return {"FINISHED"}
@@ -746,15 +753,16 @@ class _ChatMixin:
 
         layout.separator()
 
-        # ── Input + Send ─────────────────────────────────────────────
-        row = layout.row(align=True)
-        row.prop(props, "prompt", text="")
-        send_row = row.row(align=True)
-        send_row.scale_x = 0.4
-        send_row.enabled = not props.is_thinking
-        send_row.operator("agender.send", text="", icon="PLAY")
+        # ── Input ────────────────────────────────────────────────────
+        layout.prop(props, "prompt", text="", icon="OUTLINER_DATA_GP_LAYER")
 
-        # ── Model selector row ───────────────────────────────────────
+        # ── Send button (full-width, separate row) ───────────────────
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.enabled = not props.is_thinking
+        row.operator("agender.send", text="Send", icon="PLAY")
+
+        # ── Model selector ───────────────────────────────────────────
         row = layout.row(align=True)
         row.prop(props, "model_preset", text="")
 
@@ -781,8 +789,12 @@ class _SettingsMixin:
         layout.prop(props, "api_base")
         layout.prop(props, "api_key")
         layout.separator()
-        layout.prop(props, "custom_model")
-        layout.label(text="Overrides dropdown when set", icon="INFO")
+        layout.label(text="Model Override (leave empty to use dropdown):")
+        layout.prop(props, "custom_model", text="")
+        if props.custom_model and props.custom_model.strip():
+            layout.label(text=f"Active: {props.custom_model.strip()}", icon="CHECKMARK")
+        else:
+            layout.label(text="Using dropdown selection", icon="INFO")
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
