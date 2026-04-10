@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "agender"
+version = "1.0.0"
+name = "Agender"
+tagline = "AI-powered natural language assistant for Blender"
+maintainer = "Agender <agender@github>"
+type = "add-on"
+license = ["SPDX:MIT"]
+
+blender_version_min = "4.2.0"
+
+[permissions]
+network = "Call LLM API and accept commands from external agents"
+files = "Import 3D assets from local filesystem"
