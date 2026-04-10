@@ -580,24 +580,54 @@ class AGENDER_OT_clear(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _area_window_region(area):
+    for reg in area.regions:
+        if reg.type == "WINDOW":
+            return reg
+    return area.regions[0] if area.regions else None
+
+
 class AGENDER_OT_dock_left(bpy.types.Operator):
-    """Split viewport and dock Agender chat on the left"""
+    """Split the widest 3D viewport once; open Agender in the left column."""
     bl_idname = "agender.dock_left"
     bl_label = "Dock Left"
+    bl_description = (
+        "Split the main 3D viewport once to add a left column for Agender "
+        "(only works when there is a single 3D View area)"
+    )
 
     def execute(self, context):
-        target = None
-        for area in context.screen.areas:
-            if area.type == "VIEW_3D":
-                target = area
-                break
-        if not target:
+        view3ds = [a for a in context.screen.areas if a.type == "VIEW_3D"]
+        if not view3ds:
             self.report({"WARNING"}, "No 3D Viewport found")
+            return {"CANCELLED"}
+
+        # Already split / multiple 3D areas: never split again from a thin strip
+        if len(view3ds) > 1:
+            self.report(
+                {"INFO"},
+                "Multiple 3D View areas already — drag borders to resize, "
+                "or join areas (drag one onto another) then click Dock Left once",
+            )
+            return {"CANCELLED"}
+
+        target = view3ds[0]
+        min_w = 480
+        if target.width < min_w:
+            self.report(
+                {"WARNING"},
+                f"3D View too narrow ({target.width}px) — widen it before docking",
+            )
+            return {"CANCELLED"}
+
+        win_reg = _area_window_region(target)
+        if not win_reg:
+            self.report({"WARNING"}, "Could not find window region for split")
             return {"CANCELLED"}
 
         n = len(list(context.screen.areas))
         try:
-            with bpy.context.temp_override(area=target, region=target.regions[0]):
+            with bpy.context.temp_override(area=target, region=win_reg):
                 bpy.ops.screen.area_split(direction="VERTICAL", factor=0.28)
         except Exception as e:
             self.report({"WARNING"}, f"Split failed: {e}")
@@ -625,7 +655,7 @@ class AGENDER_OT_dock_left(bpy.types.Operator):
                 if hasattr(sp, "show_region_header"):
                     sp.show_region_header = False
 
-        self.report({"INFO"}, "Agender docked — click the Agender tab in the left sidebar")
+        self.report({"INFO"}, "Docked once — open the Agender tab (N) in the left column")
         return {"FINISHED"}
 
 
