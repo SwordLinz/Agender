@@ -1,17 +1,17 @@
 """
-Agender — Cursor-style AI chat panel for Blender.
+Agender — AI chat panel for Blender (History + Chat panels).
 
-Single sidebar with three stacked regions (like a left chat column):
-  Sessions — search, New Chat, date-grouped history
-  Chat — message stream + welcome tips
-  Composer — prompt, model picker, send (up arrow), quick actions
-
-Also: dock-left split, sessions on disk under ~/.agender/sessions/
-Panels: VIEW_3D + TEXT_EDITOR
+Features:
+ - OpenRouter models, session files under ~/.agender/sessions/
+ - Optional reference image: Browse / paste file path / paste bitmap (Pillow)
+ - Multimodal user messages (data URL) when an image is attached
+ - Dock-left (single split), VIEW_3D + TEXT_EDITOR sidebars
 """
 
+import base64
 import bpy
 import json
+from bpy_extras.io_utils import ImportHelper
 import os
 import re
 import shutil
@@ -214,11 +214,34 @@ def _effective_model(props):
     return props.model_preset
 
 
-def _filter_sessions(sessions, query):
-    if not query or not str(query).strip():
-        return sessions
-    q = str(query).strip().lower()
-    return [s for s in sessions if q in (s.get("title") or "").lower()]
+_IMAGE_EXTS = {
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff",
+}
+
+
+def _mime_for_ext(ext):
+    ext = ext.lower()
+    return {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".bmp": "image/bmp",
+        ".tif": "image/tiff",
+        ".tiff": "image/tiff",
+    }.get(ext, "application/octet-stream")
+
+
+def _normalize_clipboard_path(raw):
+    s = (raw or "").strip().strip('"').strip("'")
+    if not s:
+        return ""
+    if s.lower().startswith("file://"):
+        s = s[7:]
+        if len(s) >= 3 and s[0] == "/" and s[2] == ":":
+            s = s[1:]
+    return os.path.normpath(s)
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -263,15 +286,19 @@ class AgenderProperties(bpy.types.PropertyGroup):
         description="Enter a custom model ID to override the dropdown",
     )
 
+    # Optional reference image (vision / multimodal APIs)
+    image_path: bpy.props.StringProperty(
+        name="Image",
+        description="Reference image file sent with the next message (vision models)",
+        default="",
+        subtype="FILE_PATH",
+        maxlen=1024,
+    )
+
     # State
     is_thinking: bpy.props.BoolProperty(default=False)
     active_session_uid: bpy.props.StringProperty()
     session_timestamp: bpy.props.FloatProperty()
-    history_filter: bpy.props.StringProperty(
-        name="",
-        description="Filter saved chats by title",
-        default="",
-    )
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -315,6 +342,7 @@ Rules:
 - rotation: degrees. color: 0.0-1.0 RGB. location: meters.
 - Reference objects by exact name from scene context.
 - Give new objects meaningful names.
+- If the user attached a reference image, use it only as context; still output ONLY the JSON array.
 
 Current scene:
 {scene_context}"""
@@ -373,7 +401,15 @@ class AGENDER_OT_send(bpy.types.Operator):
     def execute(self, context):
         props = context.scene.agender
         prompt = props.prompt.strip()
-        if not prompt:
+        img_raw = (props.image_path or "").strip().strip('"').strip("'")
+        img_path = os.path.normpath(img_raw) if img_raw else ""
+        has_img = bool(
+            img_path and os.path.isfile(img_path)
+            and os.path.splitext(img_path)[1].lower() in _IMAGE_EXTS
+        )
+
+        if not prompt and not has_img:
+            self.report({"WARNING"}, "Enter text or attach an image")
             return {"CANCELLED"}
         if not props.api_key:
             self.report({"WARNING"}, "Set your API Key in Agender ▸ Settings first")
@@ -383,11 +419,19 @@ class AGENDER_OT_send(bpy.types.Operator):
             props.active_session_uid = str(_uuid.uuid4())
             props.session_timestamp = time.time()
 
+        lines = []
+        if prompt:
+            lines.append(prompt)
+        if has_img:
+            lines.append(f"📷 {os.path.basename(img_path)}")
         msg = props.messages.add()
         msg.role = "user"
-        msg.content = prompt
+        msg.content = "\n".join(lines) if lines else "📷 (image)"
         props.prompt = ""
+        props.image_path = ""
         props.is_thinking = True
+
+        img_for_api = img_path if has_img else ""
 
         try:
             info = executor._execute_one({"type": "scene_info", "params": {}})
@@ -402,7 +446,7 @@ class AGENDER_OT_send(bpy.types.Operator):
         self._error = None
         self._thread = threading.Thread(
             target=self._llm_call,
-            args=(props.api_base, props.api_key, model, system, prompt),
+            args=(props.api_base, props.api_key, model, system, prompt, img_for_api),
             daemon=True,
         )
         self._thread.start()
@@ -413,14 +457,32 @@ class AGENDER_OT_send(bpy.types.Operator):
             area.tag_redraw()
         return {"RUNNING_MODAL"}
 
-    def _llm_call(self, api_base, api_key, model_id, system, prompt):
+    def _llm_call(self, api_base, api_key, model_id, system, prompt, image_path):
         try:
             url = f"{api_base}/chat/completions"
+            user_text = prompt if prompt else "(Use the attached image as context for Blender.)"
+            if image_path and os.path.isfile(image_path):
+                ext = os.path.splitext(image_path)[1].lower()
+                if ext not in _IMAGE_EXTS:
+                    raise RuntimeError(f"Unsupported image type: {ext}")
+                with open(image_path, "rb") as f:
+                    b64 = base64.standard_b64encode(f.read()).decode("ascii")
+                mime = _mime_for_ext(ext)
+                user_message = [
+                    {"type": "text", "text": user_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    },
+                ]
+            else:
+                user_message = user_text
+
             payload = {
                 "model": model_id,
                 "messages": [
                     {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
+                    {"role": "user", "content": user_message},
                 ],
                 "temperature": 0.1,
             }
@@ -506,6 +568,7 @@ class AGENDER_OT_new_chat(bpy.types.Operator):
         props.active_session_uid = str(_uuid.uuid4())
         props.session_timestamp = time.time()
         props.prompt = ""
+        props.image_path = ""
         for area in context.screen.areas:
             area.tag_redraw()
         return {"FINISHED"}
@@ -523,6 +586,7 @@ class AGENDER_OT_load_session(bpy.types.Operator):
             return {"CANCELLED"}
         _save_current(props)
         if _load_into(props, self.session_uid):
+            props.image_path = ""
             for area in context.screen.areas:
                 area.tag_redraw()
         else:
@@ -588,6 +652,130 @@ class AGENDER_OT_clear(bpy.types.Operator):
         props.messages.clear()
         props.active_session_uid = str(_uuid.uuid4())
         props.session_timestamp = time.time()
+        props.image_path = ""
+        for area in context.screen.areas:
+            area.tag_redraw()
+        return {"FINISHED"}
+
+
+class AGENDER_OT_browse_image(bpy.types.Operator, ImportHelper):
+    bl_idname = "agender.browse_image"
+    bl_label = "Reference Image"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filter_glob: bpy.props.StringProperty(
+        default="*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp;*.tif;*.tiff",
+        options={"HIDDEN"},
+    )
+
+    def execute(self, context):
+        context.scene.agender.image_path = self.filepath
+        return {"FINISHED"}
+
+
+class AGENDER_OT_paste_image_path(bpy.types.Operator):
+    bl_idname = "agender.paste_image_path"
+    bl_label = "Paste Image Path"
+    bl_description = "Use file path from clipboard (copy path in Explorer)"
+
+    def execute(self, context):
+        cb = _normalize_clipboard_path(context.window_manager.clipboard)
+        if not cb:
+            self.report({"WARNING"}, "Clipboard is empty")
+            return {"CANCELLED"}
+        if not os.path.isfile(cb):
+            self.report({"WARNING"}, "Clipboard is not an existing file path")
+            return {"CANCELLED"}
+        ext = os.path.splitext(cb)[1].lower()
+        if ext not in _IMAGE_EXTS:
+            self.report({"WARNING"}, "Not a supported image file type")
+            return {"CANCELLED"}
+        context.scene.agender.image_path = cb
+        self.report({"INFO"}, f"Image set: {os.path.basename(cb)}")
+        return {"FINISHED"}
+
+
+class AGENDER_OT_paste_image_clipboard(bpy.types.Operator):
+    bl_idname = "agender.paste_image_clipboard"
+    bl_label = "Paste Image"
+    bl_description = (
+        "Save bitmap from clipboard via system Python + Pillow "
+        "(py -3 -m pip install pillow)"
+    )
+
+    def execute(self, context):
+        tmp_dir = tempfile.mkdtemp(prefix="agender_clip_")
+        out_path = os.path.join(tmp_dir, "clipboard.png")
+        script_path = os.path.join(tmp_dir, "grab_clip.py")
+        script = (
+            "import sys\n"
+            "path = sys.argv[1]\n"
+            "try:\n"
+            "    from PIL import ImageGrab\n"
+            "except ImportError:\n"
+            "    print('NO_PIL', file=sys.stderr)\n"
+            "    sys.exit(3)\n"
+            "img = ImageGrab.grabclipboard()\n"
+            "if img is None:\n"
+            "    print('NO_IMAGE', file=sys.stderr)\n"
+            "    sys.exit(2)\n"
+            "if isinstance(img, list):\n"
+            "    print('NOT_BITMAP', file=sys.stderr)\n"
+            "    sys.exit(4)\n"
+            "img.save(path, 'PNG')\n"
+        )
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(script)
+
+        result = None
+        for cmd in (["py", "-3"], ["python3"], ["python"]):
+            try:
+                result = subprocess.run(
+                    cmd + [script_path, out_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                break
+            except FileNotFoundError:
+                continue
+        if result is None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            self.report({"ERROR"}, "No system Python (py -3 / python3)")
+            return {"CANCELLED"}
+
+        err = (result.stderr or "").strip()
+        ok = result.returncode == 0 and os.path.isfile(out_path)
+        if not ok:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            if "NO_PIL" in err:
+                self.report({"ERROR"}, "Install Pillow: py -3 -m pip install pillow")
+            elif "NO_IMAGE" in err:
+                self.report({"WARNING"}, "Clipboard has no image (copy image or screenshot first)")
+            else:
+                self.report({"WARNING"}, f"Clipboard grab failed: {err[:160]}")
+            return {"CANCELLED"}
+
+        clip_dir = os.path.join(os.path.expanduser("~"), ".agender")
+        os.makedirs(clip_dir, exist_ok=True)
+        persist = os.path.join(clip_dir, "clipboard_last.png")
+        try:
+            shutil.copy2(out_path, persist)
+        except OSError:
+            persist = out_path
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        context.scene.agender.image_path = persist
+        self.report({"INFO"}, "Image pasted from clipboard")
+        return {"FINISHED"}
+
+
+class AGENDER_OT_clear_image(bpy.types.Operator):
+    bl_idname = "agender.clear_image"
+    bl_label = "Clear Image"
+
+    def execute(self, context):
+        context.scene.agender.image_path = ""
         for area in context.screen.areas:
             area.tag_redraw()
         return {"FINISHED"}
@@ -673,131 +861,163 @@ class AGENDER_OT_dock_left(bpy.types.Operator):
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  Unified sidebar: 3 zones (Sessions | Chat | Composer)                  ║
+# ║  Panel draw mixins                                                      ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
+class _HistoryMixin:
+    """Session history list — appears above the chat panel."""
+    bl_label = "History"
+    bl_region_type = "UI"
+    bl_category = "Agender"
+    bl_order = 0
+    bl_options = {"DEFAULT_CLOSED"}
 
-def _draw_zone_sessions(col, context):
-    props = context.scene.agender
-    hdr = col.row()
-    hdr.scale_y = 0.72
-    hdr.label(text="Sessions", icon="TIME")
-    col.prop(props, "history_filter", text="", icon="VIEWZOOM")
-    row = col.row()
-    row.scale_y = 1.05
-    row.operator("agender.new_chat", text="New Chat", icon="ADD")
+    def draw_header(self, context):
+        self.layout.operator("agender.new_chat", text="", icon="FILE_NEW")
 
-    sessions = _filter_sessions(_get_sessions(), props.history_filter)
-    if not sessions:
-        col.label(text="No saved chats yet", icon="INFO")
-        return
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.agender
+        sessions = _get_sessions()
 
-    cur_group = None
-    shown = 0
-    for s in sessions:
-        if shown >= 40:
-            col.label(text="…", icon="THREE_DOTS")
-            break
-        grp = _date_group(s["timestamp"])
-        if grp != cur_group:
-            cur_group = grp
-            g = col.row()
-            g.scale_y = 0.68
-            g.label(text=grp)
-        row = col.row(align=True)
-        active = s["uid"] == props.active_session_uid
-        icon = "RADIOBUT_ON" if active else "DOT"
-        t = s["title"]
-        disp = t[:28] + "…" if len(t) > 28 else t
-        op = row.operator("agender.load_session", text=disp, icon=icon)
-        op.session_uid = s["uid"]
-        sub = row.row(align=True)
-        sub.scale_x = 0.22
-        del_op = sub.operator("agender.delete_session", text="", icon="PANEL_CLOSE")
-        del_op.session_uid = s["uid"]
-        shown += 1
+        if not sessions:
+            layout.label(text="No past chats yet.", icon="INFO")
+            return
+
+        cur_group = None
+        shown = 0
+        for s in sessions:
+            if shown >= 50:
+                layout.label(text="…", icon="THREE_DOTS")
+                break
+
+            grp = _date_group(s["timestamp"])
+            if grp != cur_group:
+                cur_group = grp
+                row = layout.row()
+                row.scale_y = 0.7
+                row.label(text=grp)
+
+            row = layout.row(align=True)
+            active = s["uid"] == props.active_session_uid
+            icon = "RADIOBUT_ON" if active else "DOT"
+            op = row.operator(
+                "agender.load_session",
+                text=s["title"][:32],
+                icon=icon,
+            )
+            op.session_uid = s["uid"]
+
+            sub = row.row(align=True)
+            sub.scale_x = 0.25
+            del_op = sub.operator("agender.delete_session", text="", icon="PANEL_CLOSE")
+            del_op.session_uid = s["uid"]
+            shown += 1
 
 
-def _draw_zone_chat(col, context):
-    props = context.scene.agender
-    hdr = col.row()
-    hdr.scale_y = 0.72
-    hdr.label(text="Chat", icon="FILE_TEXT")
+class _ChatMixin:
+    """Main chat panel — messages, input, model selector."""
+    bl_label = "Agender"
+    bl_region_type = "UI"
+    bl_category = "Agender"
+    bl_order = 1
 
-    if len(props.messages) == 0 and not props.is_thinking:
-        tip = col.box()
-        t = tip.column(align=True)
-        t.scale_y = 0.82
-        t.label(text="Agender — Blender AI", icon="LIGHT")
-        t.separator(factor=0.3)
-        t.label(text="Examples:")
-        t.label(text="  • Red sphere at (2,0,1)")
-        t.label(text="  • Animate cube drop")
-        t.label(text="  • Three-point light")
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.agender
 
-    max_shown = 48
-    start = max(0, len(props.messages) - max_shown)
-    for i in range(start, len(props.messages)):
-        m = props.messages[i]
-        if m.role == "user":
-            bubble = col.box()
-            row = bubble.row(align=True)
-            row.alignment = "LEFT"
-            ic = row.column()
-            ic.scale_x = 0.28
-            ic.label(text="", icon="USER")
-            tc = row.column()
-            tc.scale_y = 0.82
-            for ln in _wrap(m.content, 34):
-                tc.label(text=ln)
-        else:
-            bubble = col.box()
-            tcol = bubble.column(align=True)
-            tcol.scale_y = 0.82
-            for j, line in enumerate(m.content.split("\n")):
-                if not line:
-                    continue
-                icon = "NONE"
-                if line.startswith("\u2713"):
-                    icon = "CHECKMARK"
-                    line = line[1:].strip()
-                elif line.startswith("\u2717"):
-                    icon = "ERROR"
-                    line = line[1:].strip()
-                elif j == 0:
-                    icon = "LIGHT"
-                for w in _wrap(line, 36):
-                    tcol.label(text=w, icon=icon)
+        # ── Welcome ──────────────────────────────────────────────────
+        if len(props.messages) == 0 and not props.is_thinking:
+            box = layout.box()
+            col = box.column(align=True)
+            col.scale_y = 0.85
+            col.label(text="Hi, I'm Agender.", icon="LIGHT")
+            col.label(text="Your AI assistant for Blender.")
+            col.separator()
+            col.label(text="Try:", icon="QUESTION")
+            col.label(text='  "Add a red sphere at (2,0,1)"')
+            col.label(text='  "Animate the cube falling"')
+            col.label(text='  "Set up three-point lighting"')
+
+        # ── Messages ─────────────────────────────────────────────────
+        max_shown = 50
+        start = max(0, len(props.messages) - max_shown)
+        for i in range(start, len(props.messages)):
+            m = props.messages[i]
+            if m.role == "user":
+                box = layout.box()
+                row = box.row(align=True)
+                row.alignment = "LEFT"
+                ic = row.column()
+                ic.scale_x = 0.3
+                ic.label(text="", icon="USER")
+                tc = row.column()
+                tc.scale_y = 0.85
+                for ln in _wrap(m.content, 36):
+                    tc.label(text=ln)
+            else:
+                box = layout.box()
+                col = box.column(align=True)
+                col.scale_y = 0.85
+                for j, line in enumerate(m.content.split("\n")):
+                    if not line:
+                        continue
                     icon = "NONE"
+                    if line.startswith("\u2713"):
+                        icon = "CHECKMARK"
+                        line = line[1:].strip()
+                    elif line.startswith("\u2717"):
+                        icon = "ERROR"
+                        line = line[1:].strip()
+                    elif j == 0:
+                        icon = "LIGHT"
+                    for w in _wrap(line, 38):
+                        col.label(text=w, icon=icon)
+                        icon = "NONE"
 
-    if props.is_thinking:
-        th = col.box()
-        r = th.row()
-        r.alignment = "CENTER"
-        r.label(text="Thinking…", icon="SORTTIME")
+        # ── Thinking ─────────────────────────────────────────────────
+        if props.is_thinking:
+            box = layout.box()
+            row = box.row()
+            row.alignment = "CENTER"
+            row.label(text="Thinking…", icon="SORTTIME")
 
+        layout.separator()
 
-def _draw_zone_composer(col, context):
-    props = context.scene.agender
-    hdr = col.row()
-    hdr.scale_y = 0.72
-    hdr.label(text="Composer", icon="OPTIONS")
+        # ── Reference image (vision / multimodal) ───────────────────
+        img_box = layout.box()
+        img_box.label(text="Image (optional)", icon="IMAGE_DATA")
+        img_box.prop(props, "image_path", text="")
+        irow = img_box.row(align=True)
+        irow.operator("agender.browse_image", text="Browse", icon="FILEBROWSER")
+        irow.operator("agender.paste_image_path", text="Paste path", icon="PASTEDOWN")
+        irow.operator("agender.paste_image_clipboard", text="Paste image", icon="TEXTURE")
+        irow.operator("agender.clear_image", text="", icon="X")
+        img_box.label(
+            text="Paste image needs system Python + Pillow",
+            icon="INFO",
+        )
 
-    col.prop(props, "prompt", text="", icon="OUTLINER_DATA_GP_LAYER")
+        # ── Input ────────────────────────────────────────────────────
+        layout.prop(props, "prompt", text="", icon="OUTLINER_DATA_GP_LAYER")
 
-    row = col.row(align=True)
-    row.scale_y = 1.12
-    row.prop(props, "model_preset", text="")
-    sub = row.row(align=True)
-    sub.scale_x = 0.55
-    sub.enabled = not props.is_thinking
-    sub.operator("agender.send", text="", icon="TRIA_UP")
+        # ── Send button (full-width, separate row) ───────────────────
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.enabled = not props.is_thinking
+        row.operator("agender.send", text="Send", icon="PLAY")
 
-    row2 = col.row(align=True)
-    row2.scale_y = 0.82
-    row2.operator("agender.scene_info", text="Scene", icon="OUTLINER")
-    row2.operator("agender.clear", text="Clear", icon="TRASH")
-    row2.operator("agender.dock_left", text="Dock", icon="WINDOW")
+        # ── Model selector ───────────────────────────────────────────
+        row = layout.row(align=True)
+        row.prop(props, "model_preset", text="")
+
+        # ── Toolbar ──────────────────────────────────────────────────
+        row = layout.row(align=True)
+        row.scale_y = 0.85
+        row.operator("agender.scene_info", text="Scene", icon="OUTLINER")
+        row.operator("agender.new_chat", text="New", icon="FILE_NEW")
+        row.operator("agender.clear", text="", icon="TRASH")
+        row.operator("agender.dock_left", text="", icon="WINDOW")
 
 
 class _SettingsMixin:
@@ -806,6 +1026,7 @@ class _SettingsMixin:
     bl_region_type = "UI"
     bl_category = "Agender"
     bl_options = {"DEFAULT_CLOSED"}
+    bl_order = 2
 
     def draw(self, context):
         layout = self.layout
@@ -821,67 +1042,44 @@ class _SettingsMixin:
             layout.label(text="Using dropdown selection", icon="INFO")
 
 
-class AGENDER_PT_sidebar(bpy.types.Panel):
-    """Single left-style sidebar: Sessions → Chat → Composer."""
-    bl_label = "Agender"
-    bl_idname = "AGENDER_PT_sidebar"
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  Concrete panels — VIEW_3D                                              ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+class AGENDER_PT_history(bpy.types.Panel, _HistoryMixin):
+    bl_idname = "AGENDER_PT_history"
     bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Agender"
-
-    def draw(self, context):
-        layout = self.layout
-        layout.use_property_split = False
-        layout.use_property_decorate = False
-
-        z1 = layout.box()
-        c1 = z1.column(align=True)
-        _draw_zone_sessions(c1, context)
-
-        z2 = layout.box()
-        c2 = z2.column(align=True)
-        _draw_zone_chat(c2, context)
-
-        z3 = layout.box()
-        c3 = z3.column(align=True)
-        _draw_zone_composer(c3, context)
 
 
-class AGENDER_PT_sidebar_te(bpy.types.Panel):
-    bl_label = "Agender"
-    bl_idname = "AGENDER_PT_sidebar_te"
-    bl_space_type = "TEXT_EDITOR"
-    bl_region_type = "UI"
-    bl_category = "Agender"
-
-    def draw(self, context):
-        layout = self.layout
-        layout.use_property_split = False
-        layout.use_property_decorate = False
-
-        z1 = layout.box()
-        c1 = z1.column(align=True)
-        _draw_zone_sessions(c1, context)
-
-        z2 = layout.box()
-        c2 = z2.column(align=True)
-        _draw_zone_chat(c2, context)
-
-        z3 = layout.box()
-        c3 = z3.column(align=True)
-        _draw_zone_composer(c3, context)
+class AGENDER_PT_chat(bpy.types.Panel, _ChatMixin):
+    bl_idname = "AGENDER_PT_chat"
+    bl_space_type = "VIEW_3D"
 
 
 class AGENDER_PT_settings(bpy.types.Panel, _SettingsMixin):
     bl_idname = "AGENDER_PT_settings"
     bl_space_type = "VIEW_3D"
-    bl_parent_id = "AGENDER_PT_sidebar"
+    bl_parent_id = "AGENDER_PT_chat"
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  Concrete panels — TEXT_EDITOR  (for left-side docking)                 ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+class AGENDER_PT_history_te(bpy.types.Panel, _HistoryMixin):
+    bl_idname = "AGENDER_PT_history_te"
+    bl_space_type = "TEXT_EDITOR"
+
+
+class AGENDER_PT_chat_te(bpy.types.Panel, _ChatMixin):
+    bl_idname = "AGENDER_PT_chat_te"
+    bl_space_type = "TEXT_EDITOR"
 
 
 class AGENDER_PT_settings_te(bpy.types.Panel, _SettingsMixin):
     bl_idname = "AGENDER_PT_settings_te"
     bl_space_type = "TEXT_EDITOR"
-    bl_parent_id = "AGENDER_PT_sidebar_te"
+    bl_parent_id = "AGENDER_PT_chat_te"
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -891,16 +1089,25 @@ class AGENDER_PT_settings_te(bpy.types.Panel, _SettingsMixin):
 _classes = (
     AgenderMessage,
     AgenderProperties,
+    # Operators
     AGENDER_OT_send,
     AGENDER_OT_new_chat,
     AGENDER_OT_load_session,
     AGENDER_OT_delete_session,
     AGENDER_OT_scene_info,
     AGENDER_OT_clear,
+    AGENDER_OT_browse_image,
+    AGENDER_OT_paste_image_path,
+    AGENDER_OT_paste_image_clipboard,
+    AGENDER_OT_clear_image,
     AGENDER_OT_dock_left,
-    AGENDER_PT_sidebar,
-    AGENDER_PT_sidebar_te,
+    # Panels — VIEW_3D
+    AGENDER_PT_history,
+    AGENDER_PT_chat,
     AGENDER_PT_settings,
+    # Panels — TEXT_EDITOR
+    AGENDER_PT_history_te,
+    AGENDER_PT_chat_te,
     AGENDER_PT_settings_te,
 )
 
