@@ -1,12 +1,13 @@
 """
 Agender — Cursor-style AI chat panel for Blender.
 
-Features:
- - Model selector dropdown (OpenRouter models)
- - Persistent chat sessions saved to ~/.agender/sessions/
- - Session history list with date grouping
- - Dock-left layout (split viewport, put chat in left Text Editor)
- - Panels registered for VIEW_3D + TEXT_EDITOR
+Single sidebar with three stacked regions (like a left chat column):
+  Sessions — search, New Chat, date-grouped history
+  Chat — message stream + welcome tips
+  Composer — prompt, model picker, send (up arrow), quick actions
+
+Also: dock-left split, sessions on disk under ~/.agender/sessions/
+Panels: VIEW_3D + TEXT_EDITOR
 """
 
 import bpy
@@ -213,6 +214,13 @@ def _effective_model(props):
     return props.model_preset
 
 
+def _filter_sessions(sessions, query):
+    if not query or not str(query).strip():
+        return sessions
+    q = str(query).strip().lower()
+    return [s for s in sessions if q in (s.get("title") or "").lower()]
+
+
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║  Properties                                                             ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
@@ -259,6 +267,11 @@ class AgenderProperties(bpy.types.PropertyGroup):
     is_thinking: bpy.props.BoolProperty(default=False)
     active_session_uid: bpy.props.StringProperty()
     session_timestamp: bpy.props.FloatProperty()
+    history_filter: bpy.props.StringProperty(
+        name="",
+        description="Filter saved chats by title",
+        default="",
+    )
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -660,149 +673,131 @@ class AGENDER_OT_dock_left(bpy.types.Operator):
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  Panel draw mixins                                                      ║
+# ║  Unified sidebar: 3 zones (Sessions | Chat | Composer)                  ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
-class _HistoryMixin:
-    """Session history list — appears above the chat panel."""
-    bl_label = "History"
-    bl_region_type = "UI"
-    bl_category = "Agender"
-    bl_order = 0
-    bl_options = {"DEFAULT_CLOSED"}
 
-    def draw_header(self, context):
-        self.layout.operator("agender.new_chat", text="", icon="FILE_NEW")
+def _draw_zone_sessions(col, context):
+    props = context.scene.agender
+    hdr = col.row()
+    hdr.scale_y = 0.72
+    hdr.label(text="Sessions", icon="TIME")
+    col.prop(props, "history_filter", text="", icon="VIEWZOOM")
+    row = col.row()
+    row.scale_y = 1.05
+    row.operator("agender.new_chat", text="New Chat", icon="ADD")
 
-    def draw(self, context):
-        layout = self.layout
-        props = context.scene.agender
-        sessions = _get_sessions()
+    sessions = _filter_sessions(_get_sessions(), props.history_filter)
+    if not sessions:
+        col.label(text="No saved chats yet", icon="INFO")
+        return
 
-        if not sessions:
-            layout.label(text="No past chats yet.", icon="INFO")
-            return
-
-        cur_group = None
-        shown = 0
-        for s in sessions:
-            if shown >= 50:
-                layout.label(text="…", icon="THREE_DOTS")
-                break
-
-            grp = _date_group(s["timestamp"])
-            if grp != cur_group:
-                cur_group = grp
-                row = layout.row()
-                row.scale_y = 0.7
-                row.label(text=grp)
-
-            row = layout.row(align=True)
-            active = s["uid"] == props.active_session_uid
-            icon = "RADIOBUT_ON" if active else "DOT"
-            op = row.operator(
-                "agender.load_session",
-                text=s["title"][:32],
-                icon=icon,
-            )
-            op.session_uid = s["uid"]
-
-            sub = row.row(align=True)
-            sub.scale_x = 0.25
-            del_op = sub.operator("agender.delete_session", text="", icon="PANEL_CLOSE")
-            del_op.session_uid = s["uid"]
-            shown += 1
+    cur_group = None
+    shown = 0
+    for s in sessions:
+        if shown >= 40:
+            col.label(text="…", icon="THREE_DOTS")
+            break
+        grp = _date_group(s["timestamp"])
+        if grp != cur_group:
+            cur_group = grp
+            g = col.row()
+            g.scale_y = 0.68
+            g.label(text=grp)
+        row = col.row(align=True)
+        active = s["uid"] == props.active_session_uid
+        icon = "RADIOBUT_ON" if active else "DOT"
+        t = s["title"]
+        disp = t[:28] + "…" if len(t) > 28 else t
+        op = row.operator("agender.load_session", text=disp, icon=icon)
+        op.session_uid = s["uid"]
+        sub = row.row(align=True)
+        sub.scale_x = 0.22
+        del_op = sub.operator("agender.delete_session", text="", icon="PANEL_CLOSE")
+        del_op.session_uid = s["uid"]
+        shown += 1
 
 
-class _ChatMixin:
-    """Main chat panel — messages, input, model selector."""
-    bl_label = "Agender"
-    bl_region_type = "UI"
-    bl_category = "Agender"
-    bl_order = 1
+def _draw_zone_chat(col, context):
+    props = context.scene.agender
+    hdr = col.row()
+    hdr.scale_y = 0.72
+    hdr.label(text="Chat", icon="FILE_TEXT")
 
-    def draw(self, context):
-        layout = self.layout
-        props = context.scene.agender
+    if len(props.messages) == 0 and not props.is_thinking:
+        tip = col.box()
+        t = tip.column(align=True)
+        t.scale_y = 0.82
+        t.label(text="Agender — Blender AI", icon="LIGHT")
+        t.separator(factor=0.3)
+        t.label(text="Examples:")
+        t.label(text="  • Red sphere at (2,0,1)")
+        t.label(text="  • Animate cube drop")
+        t.label(text="  • Three-point light")
 
-        # ── Welcome ──────────────────────────────────────────────────
-        if len(props.messages) == 0 and not props.is_thinking:
-            box = layout.box()
-            col = box.column(align=True)
-            col.scale_y = 0.85
-            col.label(text="Hi, I'm Agender.", icon="LIGHT")
-            col.label(text="Your AI assistant for Blender.")
-            col.separator()
-            col.label(text="Try:", icon="QUESTION")
-            col.label(text='  "Add a red sphere at (2,0,1)"')
-            col.label(text='  "Animate the cube falling"')
-            col.label(text='  "Set up three-point lighting"')
-
-        # ── Messages ─────────────────────────────────────────────────
-        max_shown = 50
-        start = max(0, len(props.messages) - max_shown)
-        for i in range(start, len(props.messages)):
-            m = props.messages[i]
-            if m.role == "user":
-                box = layout.box()
-                row = box.row(align=True)
-                row.alignment = "LEFT"
-                ic = row.column()
-                ic.scale_x = 0.3
-                ic.label(text="", icon="USER")
-                tc = row.column()
-                tc.scale_y = 0.85
-                for ln in _wrap(m.content, 36):
-                    tc.label(text=ln)
-            else:
-                box = layout.box()
-                col = box.column(align=True)
-                col.scale_y = 0.85
-                for j, line in enumerate(m.content.split("\n")):
-                    if not line:
-                        continue
+    max_shown = 48
+    start = max(0, len(props.messages) - max_shown)
+    for i in range(start, len(props.messages)):
+        m = props.messages[i]
+        if m.role == "user":
+            bubble = col.box()
+            row = bubble.row(align=True)
+            row.alignment = "LEFT"
+            ic = row.column()
+            ic.scale_x = 0.28
+            ic.label(text="", icon="USER")
+            tc = row.column()
+            tc.scale_y = 0.82
+            for ln in _wrap(m.content, 34):
+                tc.label(text=ln)
+        else:
+            bubble = col.box()
+            tcol = bubble.column(align=True)
+            tcol.scale_y = 0.82
+            for j, line in enumerate(m.content.split("\n")):
+                if not line:
+                    continue
+                icon = "NONE"
+                if line.startswith("\u2713"):
+                    icon = "CHECKMARK"
+                    line = line[1:].strip()
+                elif line.startswith("\u2717"):
+                    icon = "ERROR"
+                    line = line[1:].strip()
+                elif j == 0:
+                    icon = "LIGHT"
+                for w in _wrap(line, 36):
+                    tcol.label(text=w, icon=icon)
                     icon = "NONE"
-                    if line.startswith("\u2713"):
-                        icon = "CHECKMARK"
-                        line = line[1:].strip()
-                    elif line.startswith("\u2717"):
-                        icon = "ERROR"
-                        line = line[1:].strip()
-                    elif j == 0:
-                        icon = "LIGHT"
-                    for w in _wrap(line, 38):
-                        col.label(text=w, icon=icon)
-                        icon = "NONE"
 
-        # ── Thinking ─────────────────────────────────────────────────
-        if props.is_thinking:
-            box = layout.box()
-            row = box.row()
-            row.alignment = "CENTER"
-            row.label(text="Thinking…", icon="SORTTIME")
+    if props.is_thinking:
+        th = col.box()
+        r = th.row()
+        r.alignment = "CENTER"
+        r.label(text="Thinking…", icon="SORTTIME")
 
-        layout.separator()
 
-        # ── Input ────────────────────────────────────────────────────
-        layout.prop(props, "prompt", text="", icon="OUTLINER_DATA_GP_LAYER")
+def _draw_zone_composer(col, context):
+    props = context.scene.agender
+    hdr = col.row()
+    hdr.scale_y = 0.72
+    hdr.label(text="Composer", icon="OPTIONS")
 
-        # ── Send button (full-width, separate row) ───────────────────
-        row = layout.row(align=True)
-        row.scale_y = 1.3
-        row.enabled = not props.is_thinking
-        row.operator("agender.send", text="Send", icon="PLAY")
+    col.prop(props, "prompt", text="", icon="OUTLINER_DATA_GP_LAYER")
 
-        # ── Model selector ───────────────────────────────────────────
-        row = layout.row(align=True)
-        row.prop(props, "model_preset", text="")
+    row = col.row(align=True)
+    row.scale_y = 1.12
+    row.prop(props, "model_preset", text="")
+    sub = row.row(align=True)
+    sub.scale_x = 0.55
+    sub.enabled = not props.is_thinking
+    sub.operator("agender.send", text="", icon="TRIA_UP")
 
-        # ── Toolbar ──────────────────────────────────────────────────
-        row = layout.row(align=True)
-        row.scale_y = 0.85
-        row.operator("agender.scene_info", text="Scene", icon="OUTLINER")
-        row.operator("agender.new_chat", text="New", icon="FILE_NEW")
-        row.operator("agender.clear", text="", icon="TRASH")
-        row.operator("agender.dock_left", text="", icon="WINDOW")
+    row2 = col.row(align=True)
+    row2.scale_y = 0.82
+    row2.operator("agender.scene_info", text="Scene", icon="OUTLINER")
+    row2.operator("agender.clear", text="Clear", icon="TRASH")
+    row2.operator("agender.dock_left", text="Dock", icon="WINDOW")
 
 
 class _SettingsMixin:
@@ -811,7 +806,6 @@ class _SettingsMixin:
     bl_region_type = "UI"
     bl_category = "Agender"
     bl_options = {"DEFAULT_CLOSED"}
-    bl_order = 2
 
     def draw(self, context):
         layout = self.layout
@@ -827,44 +821,67 @@ class _SettingsMixin:
             layout.label(text="Using dropdown selection", icon="INFO")
 
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  Concrete panels — VIEW_3D                                              ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
-
-class AGENDER_PT_history(bpy.types.Panel, _HistoryMixin):
-    bl_idname = "AGENDER_PT_history"
+class AGENDER_PT_sidebar(bpy.types.Panel):
+    """Single left-style sidebar: Sessions → Chat → Composer."""
+    bl_label = "Agender"
+    bl_idname = "AGENDER_PT_sidebar"
     bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Agender"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = False
+        layout.use_property_decorate = False
+
+        z1 = layout.box()
+        c1 = z1.column(align=True)
+        _draw_zone_sessions(c1, context)
+
+        z2 = layout.box()
+        c2 = z2.column(align=True)
+        _draw_zone_chat(c2, context)
+
+        z3 = layout.box()
+        c3 = z3.column(align=True)
+        _draw_zone_composer(c3, context)
 
 
-class AGENDER_PT_chat(bpy.types.Panel, _ChatMixin):
-    bl_idname = "AGENDER_PT_chat"
-    bl_space_type = "VIEW_3D"
+class AGENDER_PT_sidebar_te(bpy.types.Panel):
+    bl_label = "Agender"
+    bl_idname = "AGENDER_PT_sidebar_te"
+    bl_space_type = "TEXT_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "Agender"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = False
+        layout.use_property_decorate = False
+
+        z1 = layout.box()
+        c1 = z1.column(align=True)
+        _draw_zone_sessions(c1, context)
+
+        z2 = layout.box()
+        c2 = z2.column(align=True)
+        _draw_zone_chat(c2, context)
+
+        z3 = layout.box()
+        c3 = z3.column(align=True)
+        _draw_zone_composer(c3, context)
 
 
 class AGENDER_PT_settings(bpy.types.Panel, _SettingsMixin):
     bl_idname = "AGENDER_PT_settings"
     bl_space_type = "VIEW_3D"
-    bl_parent_id = "AGENDER_PT_chat"
-
-
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  Concrete panels — TEXT_EDITOR  (for left-side docking)                 ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
-
-class AGENDER_PT_history_te(bpy.types.Panel, _HistoryMixin):
-    bl_idname = "AGENDER_PT_history_te"
-    bl_space_type = "TEXT_EDITOR"
-
-
-class AGENDER_PT_chat_te(bpy.types.Panel, _ChatMixin):
-    bl_idname = "AGENDER_PT_chat_te"
-    bl_space_type = "TEXT_EDITOR"
+    bl_parent_id = "AGENDER_PT_sidebar"
 
 
 class AGENDER_PT_settings_te(bpy.types.Panel, _SettingsMixin):
     bl_idname = "AGENDER_PT_settings_te"
     bl_space_type = "TEXT_EDITOR"
-    bl_parent_id = "AGENDER_PT_chat_te"
+    bl_parent_id = "AGENDER_PT_sidebar_te"
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -874,7 +891,6 @@ class AGENDER_PT_settings_te(bpy.types.Panel, _SettingsMixin):
 _classes = (
     AgenderMessage,
     AgenderProperties,
-    # Operators
     AGENDER_OT_send,
     AGENDER_OT_new_chat,
     AGENDER_OT_load_session,
@@ -882,13 +898,9 @@ _classes = (
     AGENDER_OT_scene_info,
     AGENDER_OT_clear,
     AGENDER_OT_dock_left,
-    # Panels — VIEW_3D
-    AGENDER_PT_history,
-    AGENDER_PT_chat,
+    AGENDER_PT_sidebar,
+    AGENDER_PT_sidebar_te,
     AGENDER_PT_settings,
-    # Panels — TEXT_EDITOR
-    AGENDER_PT_history_te,
-    AGENDER_PT_chat_te,
     AGENDER_PT_settings_te,
 )
 
